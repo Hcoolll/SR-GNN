@@ -112,7 +112,7 @@ def forward(model, i, data):
     alias_inputs, A, items, mask, targets = data.get_slice(i)
     alias_inputs = trans_to_cuda(torch.Tensor(alias_inputs).long())
     items = trans_to_cuda(torch.Tensor(items).long())
-    A = trans_to_cuda(torch.Tensor(A).float())
+    A = trans_to_cuda(torch.Tensor(np.array(A)).float())
     mask = trans_to_cuda(torch.Tensor(mask).long())
     hidden = model(items, A)
     get = lambda i: hidden[i][alias_inputs[i]]
@@ -121,7 +121,6 @@ def forward(model, i, data):
 
 
 def train_test(model, train_data, test_data):
-    model.scheduler.step()
     print('start training: ', datetime.datetime.now())
     model.train()
     total_loss = 0.0
@@ -132,11 +131,11 @@ def train_test(model, train_data, test_data):
         targets = trans_to_cuda(torch.Tensor(targets).long())
         loss = model.loss_function(scores, targets - 1)
         loss.backward()
-        model.optimizer.step()
         total_loss += loss
         if j % int(len(slices) / 5 + 1) == 0:
             print('[%d/%d] Loss: %.4f' % (j, len(slices), loss.item()))
     print('\tLoss:\t%.3f' % total_loss)
+    model.optimizer.step()
 
     print('start predicting: ', datetime.datetime.now())
     model.eval()
