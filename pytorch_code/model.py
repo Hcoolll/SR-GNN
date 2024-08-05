@@ -11,8 +11,106 @@ import math
 import numpy as np
 import torch
 from torch import nn
+import torch.optim as optim
 from torch.nn import Module, Parameter
 import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self, hidden_size=100, out_size=100, batch_size=100, L2=0.0):
+        super(Model, self).__init__()
+        self.hidden_size = hidden_size
+        self.out_size = out_size
+        self.batch_size = batch_size
+        self.stdv = 1.0 / math.sqrt(self.hidden_size)
+        self.L2 = L2
+
+        self.mask = None  # will be set during forward
+        self.alias = None  # will be set during forward
+        self.item = None  # will be set during forward
+        self.tar = None  # will be set during forward
+
+    def forward(self, re_embedding, tar, train=True):
+        rm = torch.sum(self.mask, dim=1)
+
+        # Adjust for zero-based indexing
+        last_id = self.alias[torch.arange(self.batch_size), (rm - 1).long()]
+        last_h = re_embedding[torch.arange(self.batch_size), last_id]
+        last_h = last_h.view(-1, self.out_size)
+
+        b = self.weights['embedding'][1:]  # Assuming weights is defined elsewhere
+        logits = torch.matmul(last_h, b.t())
+
+        loss_fn = nn.CrossEntropyLoss()
+        loss = loss_fn(logits, tar - 1)
+
+        # Add L2 Regularization if necessary
+        if train:
+            lossL2 = sum(torch.norm(v) for name, v in self.named_parameters() if not any(
+                exclude_name in name for exclude_name in ['bias', 'gamma', 'b', 'g', 'beta'])) * self.L2
+            loss = loss + lossL2
+
+        return loss, logits
+
+
+class SGNREC(Model):
+    def __init__(self, hidden_size=100, out_size=100, batch_size=100, n_node=None,
+                 lr=0.001, l2=0.0, layers=1, decay=None, lr_dc=0.1):
+        super(SGNREC, self).__init__(hidden_size, out_size, batch_size, L2=l2)
+
+        self.adj_in = None  # These tensors will be set during training/evaluation
+        self.adj_out = None
+
+        self.n_node = n_node
+        self.layers = layers
+        self.weights = self._init_weights()
+
+        # Optimizer setup
+        self.optimizer = optim.Adam(self.parameters(), lr=lr)
+
+    def _init_weights(self):
+        all_weights = {}
+        initializer = torch.FloatTensor(self.n_node, self.hidden_size).uniform_(-self.stdv, self.stdv)
+
+        all_weights['embedding'] = nn.Parameter(initializer)
+        all_weights['W_1'] = nn.Parameter(
+            torch.FloatTensor(2 * self.out_size, 2 * self.out_size).uniform_(-self.stdv, self.stdv))
+        all_weights['W_2'] = nn.Parameter(
+            torch.FloatTensor(2 * self.out_size, self.out_size).uniform_(-self.stdv, self.stdv))
+
+        return all_weights
+
+    def sgc(self):
+        fin_state = self.weights['embedding'][self.item]  # Assuming self.item is already tensor with required indices
+        fin_state = fin_state.view(self.batch_size, -1, self.out_size)
+        fin_state_in = fin_state
+        fin_state_out = fin_state
+
+        adj_in = self.adj_in ** self.layers
+        adj_out = self.adj_out ** self.layers
+
+        fin_state_in = torch.matmul(adj_in, fin_state_in)
+        fin_state_out = torch.matmul(adj_out, fin_state_out)
+        av = torch.cat([fin_state_in, fin_state_out], dim=-1)
+        av = nn.functional.relu(torch.matmul(av, self.weights['W_1']))
+        av = torch.matmul(av, self.weights['W_2'])
+
+        return av.view(self.batch_size, -1, self.out_size)
+
+    def run(self, tar, item, adj_in, adj_out, alias, mask):
+        # Set these variables before calling forward
+        self.tar = tar
+        self.item = item
+        self.adj_in = adj_in
+        self.adj_out = adj_out
+        self.alias = alias
+        self.mask = mask
+
+        # Forward pass
+        re_embedding = self.sgc()
+        loss, logits = self.forward(re_embedding, tar)
+
+        return loss, logits
 
 
 class GNN(Module):

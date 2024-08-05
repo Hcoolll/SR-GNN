@@ -77,13 +77,14 @@ class Data():
         slices[-1] = slices[-1][:(self.length - batch_size * (n_batch - 1))]
         return slices
 
-    def get_slice(self, i):
-        inputs, mask, targets = self.inputs[i], self.mask[i], self.targets[i]
-        items, n_node, A, alias_inputs = [], [], [], []
-        for u_input in inputs:
+    def get_slice(self, index):
+        items, n_node, A_in, A_out, alias_inputs = [], [], [], [], []
+
+        for u_input in self.inputs[index]:
             n_node.append(len(np.unique(u_input)))
         max_n_node = np.max(n_node)
-        for u_input in inputs:
+
+        for u_input in self.inputs[index]:
             node = np.unique(u_input)
             items.append(node.tolist() + (max_n_node - len(node)) * [0])
             u_A = np.zeros((max_n_node, max_n_node))
@@ -96,10 +97,13 @@ class Data():
             u_sum_in = np.sum(u_A, 0)
             u_sum_in[np.where(u_sum_in == 0)] = 1
             u_A_in = np.divide(u_A, u_sum_in)
+            u_A_in = u_A_in + np.eye(u_A_in.shape[0])
             u_sum_out = np.sum(u_A, 1)
             u_sum_out[np.where(u_sum_out == 0)] = 1
             u_A_out = np.divide(u_A.transpose(), u_sum_out)
-            u_A = np.concatenate([u_A_in, u_A_out]).transpose()
-            A.append(u_A)
+            u_A_out = u_A_out + np.eye(u_A_out.shape[0])
+
+            A_in.append(u_A_in)
+            A_out.append(u_A_out)
             alias_inputs.append([np.where(node == i)[0][0] for i in u_input])
-        return alias_inputs, A, items, mask, targets
+        return A_in, A_out, alias_inputs, items, self.mask[index], self.targets[index]
