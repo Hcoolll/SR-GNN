@@ -78,6 +78,7 @@ class Data():
         return slices
 
     def get_slice(self, index):
+        inputs, mask, targets = self.inputs[index], self.mask[index], self.targets[index]
         items, n_node, A_in, A_out, alias_inputs = [], [], [], [], []
 
         for u_input in self.inputs[index]:
@@ -106,4 +107,5 @@ class Data():
             A_in.append(u_A_in)
             A_out.append(u_A_out)
             alias_inputs.append([np.where(node == i)[0][0] for i in u_input])
-        return A_in, A_out, alias_inputs, items, self.mask[index], self.targets[index]
+        return A_in, A_out, alias_inputs, items, mask, targets
+

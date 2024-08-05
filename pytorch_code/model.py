@@ -16,57 +16,15 @@ from torch.nn import Module, Parameter
 import torch.nn.functional as F
 
 
-class Model(nn.Module):
-    def __init__(self, hidden_size=100, out_size=100, batch_size=100, L2=0.0):
-        super(Model, self).__init__()
+class SGNREC(Module):
+    def __init__(self, hidden_size, layers=1):
+        super(SGNREC, self).__init__()
+
         self.hidden_size = hidden_size
-        self.out_size = out_size
-        self.batch_size = batch_size
-        self.stdv = 1.0 / math.sqrt(self.hidden_size)
-        self.L2 = L2
-
-        self.mask = None  # will be set during forward
-        self.alias = None  # will be set during forward
-        self.item = None  # will be set during forward
-        self.tar = None  # will be set during forward
-
-    def forward(self, re_embedding, tar, train=True):
-        rm = torch.sum(self.mask, dim=1)
-
-        # Adjust for zero-based indexing
-        last_id = self.alias[torch.arange(self.batch_size), (rm - 1).long()]
-        last_h = re_embedding[torch.arange(self.batch_size), last_id]
-        last_h = last_h.view(-1, self.out_size)
-
-        b = self.weights['embedding'][1:]  # Assuming weights is defined elsewhere
-        logits = torch.matmul(last_h, b.t())
-
-        loss_fn = nn.CrossEntropyLoss()
-        loss = loss_fn(logits, tar - 1)
-
-        # Add L2 Regularization if necessary
-        if train:
-            lossL2 = sum(torch.norm(v) for name, v in self.named_parameters() if not any(
-                exclude_name in name for exclude_name in ['bias', 'gamma', 'b', 'g', 'beta'])) * self.L2
-            loss = loss + lossL2
-
-        return loss, logits
-
-
-class SGNREC(Model):
-    def __init__(self, hidden_size=100, out_size=100, batch_size=100, n_node=None,
-                 lr=0.001, l2=0.0, layers=1, decay=None, lr_dc=0.1):
-        super(SGNREC, self).__init__(hidden_size, out_size, batch_size, L2=l2)
-
-        self.adj_in = None  # These tensors will be set during training/evaluation
-        self.adj_out = None
-
-        self.n_node = n_node
         self.layers = layers
+        self.batch_size = hidden_size
+        self.out_size = hidden_size
         self.weights = self._init_weights()
-
-        # Optimizer setup
-        self.optimizer = optim.Adam(self.parameters(), lr=lr)
 
     def _init_weights(self):
         all_weights = {}
@@ -80,14 +38,12 @@ class SGNREC(Model):
 
         return all_weights
 
-    def sgc(self):
-        fin_state = self.weights['embedding'][self.item]  # Assuming self.item is already tensor with required indices
-        fin_state = fin_state.view(self.batch_size, -1, self.out_size)
-        fin_state_in = fin_state
-        fin_state_out = fin_state
-
-        adj_in = self.adj_in ** self.layers
-        adj_out = self.adj_out ** self.layers
+    def sgc(self, a_in, a_out, hidden):
+        hidden = hidden.view(self.batch_size, -1, self.out_size)
+        fin_state_in = hidden
+        fin_state_out = hidden
+        adj_in = a_in ** self.layers
+        adj_out = a_out ** self.layers
 
         fin_state_in = torch.matmul(adj_in, fin_state_in)
         fin_state_out = torch.matmul(adj_out, fin_state_out)
@@ -97,20 +53,10 @@ class SGNREC(Model):
 
         return av.view(self.batch_size, -1, self.out_size)
 
-    def run(self, tar, item, adj_in, adj_out, alias, mask):
-        # Set these variables before calling forward
-        self.tar = tar
-        self.item = item
-        self.adj_in = adj_in
-        self.adj_out = adj_out
-        self.alias = alias
-        self.mask = mask
-
-        # Forward pass
-        re_embedding = self.sgc()
-        loss, logits = self.forward(re_embedding, tar)
-
-        return loss, logits
+    def forward(self, a_in, a_out, hidden):
+        for i in range(self.layers):
+            hidden = self.sgc(a_in, a_out, hidden)
+        return hidden
 
 
 class GNN(Module):
@@ -159,7 +105,7 @@ class SessionGraph(Module):
         self.batch_size = opt.batchSize
         self.nonhybrid = opt.nonhybrid
         self.embedding = nn.Embedding(self.n_node, self.hidden_size)
-        self.gnn = GNN(self.hidden_size, step=opt.step)
+        # self.gnn = GNN(self.hidden_size, step=opt.step)
         self.linear_one = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.linear_two = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.linear_three = nn.Linear(self.hidden_size, 1, bias=False)
@@ -168,6 +114,8 @@ class SessionGraph(Module):
         self.optimizer = torch.optim.Adam(self.parameters(), lr=opt.lr, weight_decay=opt.l2)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
         self.reset_parameters()
+
+        self.sgn = SGNREC(hidden_size=opt.hiddenSize, layers=opt.layers)
 
     def reset_parameters(self):
         stdv = 1.0 / math.sqrt(self.hidden_size)
@@ -186,9 +134,9 @@ class SessionGraph(Module):
         scores = torch.matmul(a, b.transpose(1, 0))
         return scores
 
-    def forward(self, inputs, A):
+    def forward(self, inputs, a_in, a_out):
         hidden = self.embedding(inputs)
-        hidden = self.gnn(A, hidden)
+        hidden = self.sgn(a_in, a_out, hidden)
         return hidden
 
 
@@ -207,14 +155,18 @@ def trans_to_cpu(variable):
 
 
 def forward(model, i, data):
-    alias_inputs, A, items, mask, targets = data.get_slice(i)
-    alias_inputs = trans_to_cuda(torch.Tensor(alias_inputs).long())
-    items = trans_to_cuda(torch.Tensor(items).long())
-    A = trans_to_cuda(torch.Tensor(np.array(A)).float())
+    adj_in, adj_out, alias, item, mask, targets = data.get_slice(i)
+
+    adj_in = trans_to_cuda(torch.Tensor(np.array(adj_in)).float())
+    adj_out = trans_to_cuda(torch.Tensor(np.array(adj_out)).float())
+
+    alias = trans_to_cuda(torch.Tensor(alias).long())
+    item = trans_to_cuda(torch.Tensor(item).long())
     mask = trans_to_cuda(torch.Tensor(mask).long())
-    hidden = model(items, A)
-    get = lambda i: hidden[i][alias_inputs[i]]
-    seq_hidden = torch.stack([get(i) for i in torch.arange(len(alias_inputs)).long()])
+
+    hidden = model(item, adj_in, adj_out)
+    get = lambda i: hidden[i][alias[i]]
+    seq_hidden = torch.stack([get(i) for i in torch.arange(len(alias)).long()])
     return targets, model.compute_scores(seq_hidden, mask)
 
 
